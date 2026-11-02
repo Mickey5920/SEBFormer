@@ -1,412 +1,358 @@
-# model.py
+"""SEBFormer: source-specific encoders, shared bottleneck fusion and a linear head."""
+
+import hashlib
 import math
+from typing import Sequence
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# =========================
-# ======= Utilities =======
-# =========================
-def maybe_compile(module: nn.Module, enable_compile: bool = True):
-    if enable_compile and hasattr(torch, "compile"):
-        try:
-            module = torch.compile(module, fullgraph=False, dynamic=True)
-        except Exception:
-            pass
-    return module
-
-def rope_rotate(x, cos, sin):
-    """
-    x:   [B, T, h, hd] （hd 为偶数）
-    cos: [1, T, 1, hd/2]
-    sin: [1, T, 1, hd/2]
-    对最后一维 (even, odd) 成对应用旋转。
-    """
-    x1, x2 = x[..., ::2], x[..., 1::2]  # [B, T, h, hd/2]
-    xr1 = x1 * cos - x2 * sin
-    xr2 = x1 * sin + x2 * cos
-    return torch.stack([xr1, xr2], dim=-1).flatten(-2)  # [B, T, h, hd]
-
-def build_rope_cache(seq_len, head_dim, device, base=10000.0):
-    """
-    Return cos, sin with shape [1, T, 1, hd/2]
-    (注意：与 x[..., ::2]/x[..., 1::2] 的尺寸一致，不要重复成 hd)
-    """
-    assert head_dim % 2 == 0, "RoPE head_dim must be even"
-    half = head_dim // 2
-    inv_freq = 1.0 / (base ** (torch.arange(0, half, device=device).float() / half))
-    t = torch.arange(seq_len, device=device).float()              # [T]
-    freqs = torch.einsum('t,d->td', t, inv_freq)                  # [T, half]
-    cos = torch.cos(freqs).unsqueeze(0).unsqueeze(2)              # [1, T, 1, half]
-    sin = torch.sin(freqs).unsqueeze(0).unsqueeze(2)              # [1, T, 1, half]
-    return cos, sin
+from torch import nn
 
 
-# ====================================================
-# ======== Channel Attention (kept & improved) =======
-# ====================================================
-class ChannelAttention(nn.Module):
-    def __init__(self, in_channels, reduction=8):
-        super().__init__()
-        mid = max(8, in_channels // reduction)
-        self.fc1 = nn.Linear(in_channels, mid)
-        self.fc2 = nn.Linear(mid, in_channels)
-
-    def forward(self, x):
-        # x: [B, C] or [B, N, C]
-        if x.dim() == 3:
-            pooled = x.mean(1)  # [B, C]
-        else:
-            pooled = x
-        attn = F.relu(self.fc1(pooled))
-        attn = torch.sigmoid(self.fc2(attn))  # [B, C]
-        if x.dim() == 3:
-            attn = attn.unsqueeze(1)
-        return x * attn
-
-# ================================================
-# ======= Capsule for Tabular (vectorized) =======
-# ================================================
 class PrimaryCapsules(nn.Module):
-    """
-    Map each tabular group to multiple primary capsules in parallel.
-    """
-    def __init__(self, in_dim, num_caps=4, cap_dim=16):
+    def __init__(self, in_dim: int, num_caps: int = 4, cap_dim: int = 16):
         super().__init__()
-        self.in_dim = in_dim
         self.num_caps = num_caps
         self.cap_dim = cap_dim
         self.proj = nn.Linear(in_dim, num_caps * cap_dim)
 
-    def forward(self, x):  # x: [B, in_dim]
-        B = x.size(0)
-        out = self.proj(x).view(B, self.num_caps, self.cap_dim)  # [B, C1, D1]
-        # squash
+    def forward(self, x):
+        batch = x.size(0)
+        out = self.proj(x).view(batch, self.num_caps, self.cap_dim)
         norm = out.norm(dim=-1, keepdim=True) + 1e-8
-        out = (out / norm) * (norm**2 / (1.0 + norm**2))
-        return out  # [B, C1, D1]
+        return (out / norm) * (norm.square() / (1.0 + norm.square()))
+
 
 class DigitCapsules(nn.Module):
-    """
-    One shared DigitCaps layer that aggregates all primary capsules (concatenated from groups)
-    to a single vector representation via dynamic routing.
-    """
-    def __init__(self, in_caps, in_dim, out_caps=1, out_dim=256, routing_iters=3):
+    def __init__(
+        self, in_caps: int, in_dim: int, out_dim: int = 256, routing_iters: int = 3
+    ):
         super().__init__()
         self.in_caps = in_caps
-        self.in_dim = in_dim
-        self.out_caps = out_caps
-        self.out_dim = out_dim
         self.routing_iters = routing_iters
-        # Transform matrices
-        self.W = nn.Parameter(0.02 * torch.randn(1, in_caps, out_caps, out_dim, in_dim))
+        self.W = nn.Parameter(0.02 * torch.randn(1, in_caps, 1, out_dim, in_dim))
 
-    def forward(self, u):  # u: [B, in_caps, in_dim]
-        B = u.size(0)
-        # W: [1, in_caps, out_caps, out_dim, in_dim] -> [B, in_caps, out_caps, out_dim, in_dim]
-        W = self.W.expand(B, -1, -1, -1, -1)
-        # u: [B, in_caps, in_dim] -> [B, in_caps, 1, in_dim] -> [B, in_caps, 1, in_dim, 1]
-        u = u.unsqueeze(2).unsqueeze(-1)
-        # matmul: [B, in_caps, out_caps, out_dim, in_dim] @ [B, in_caps, 1, in_dim, 1]
-        u_hat = torch.matmul(W, u).squeeze(-1)  # [B, in_caps, out_caps, out_dim]
-
-        b = torch.zeros(B, self.in_caps, self.out_caps, device=u_hat.device)
+    def forward(self, u):
+        batch = u.size(0)
+        W = self.W.expand(batch, -1, -1, -1, -1)
+        u_hat = torch.matmul(W, u.unsqueeze(2).unsqueeze(-1)).squeeze(-1)
+        logits = torch.zeros(batch, self.in_caps, 1, device=u.device, dtype=u.dtype)
         for _ in range(self.routing_iters):
-            c = torch.softmax(b, dim=2).unsqueeze(-1)      # [B, in_caps, out_caps, 1]
-            s = (c * u_hat).sum(dim=1)                     # [B, out_caps, out_dim]
-            # squash
-            s_norm = s.norm(dim=-1, keepdim=True) + 1e-8
-            v = (s / s_norm) * (s_norm**2 / (1.0 + s_norm**2))  # [B, out_caps, out_dim]
-            b = b + (u_hat * v.unsqueeze(1)).sum(-1)       # [B, in_caps, out_caps]
+            coeff = torch.softmax(logits, dim=2).unsqueeze(-1)
+            s = (coeff * u_hat).sum(dim=1)
+            norm = s.norm(dim=-1, keepdim=True) + 1e-8
+            v = (s / norm) * (norm.square() / (1.0 + norm.square()))
+            logits = logits + (u_hat * v.unsqueeze(1)).sum(-1)
+        return v.squeeze(1)
 
-        v = v.squeeze(1)  # [B, out_dim] if out_caps == 1
-        return v
 
 class TabularCapsuleExtractor(nn.Module):
-    """
-    Take multiple tabular groups; build primary caps per group, then concatenate and route.
-    """
-    def __init__(self, dims, out_dim=256, num_caps_per_group=4, cap_dim=16, routing_iters=3):
-        super().__init__()
-        self.groups = nn.ModuleList([
-            PrimaryCapsules(d, num_caps=num_caps_per_group, cap_dim=cap_dim)
-            for d in dims
-        ])
-        in_caps = len(dims) * num_caps_per_group
-        self.digit_caps = DigitCapsules(in_caps=in_caps, in_dim=cap_dim,
-                                        out_caps=1, out_dim=out_dim, routing_iters=routing_iters)
-
-    def forward(self, features):  # list[tensor], each [B, d]
-        prims = [g(f) for g, f in zip(self.groups, features)]  # each [B, C1, D1]
-        u = torch.cat(prims, dim=1)  # [B, in_caps, cap_dim]
-        v = self.digit_caps(u)       # [B, out_dim]
-        return v
-
-
-
-class SDPAMultiheadAttention(nn.Module):
-    def __init__(self, dim, n_heads=8, rope=False, dropout=0.0):
-        super().__init__()
-        assert dim % n_heads == 0
-        self.dim = dim
-        self.n = n_heads
-        self.hdim = dim // n_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.out = nn.Linear(dim, dim, bias=False)
-        self.rope = rope
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, attn_mask=None, rope_cache=None):  # x: [B,T,D]
-        B, T, D = x.shape
-        qkv = self.qkv(x).view(B, T, 3, self.n, self.hdim).transpose(2, 3)  # [B, T, h, 3, hd]
-        q, k, v = qkv[..., 0, :], qkv[..., 1, :], qkv[..., 2, :]             # [B, T, h, hd]
-
-        # ✅ 先在 [B, T, h, hd] 形状下应用 RoPE（cos/sin: [1, T, 1, hd/2]）
-        if self.rope and rope_cache is not None:
-            cos, sin = rope_cache  # [1, L, 1, hd/2]
-            assert self.hdim % 2 == 0, "head_dim must be even for RoPE"
-            q = rope_rotate(q, cos[:, :T], sin[:, :T])  # 现在广播维度完全对齐
-            k = rope_rotate(k, cos[:, :T], sin[:, :T])
-
-        # 再转成 [B, h, T, hd] 进入 SDPA
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # SDPA
-        q_ = q.reshape(B * self.n, T, self.hdim)
-        k_ = k.reshape(B * self.n, T, self.hdim)
-        v_ = v.reshape(B * self.n, T, self.hdim)
-        attn = torch.nn.functional.scaled_dot_product_attention(
-            q_, k_, v_, attn_mask=None, dropout_p=0.0, is_causal=False,
-        )  # [B*h, T, hd]
-        attn = attn.reshape(B, self.n, T, self.hdim).transpose(1, 2).reshape(B, T, D)
-        attn = self.out(attn)
-        return self.dropout(attn)
-
-# ====================================================
-# ======= Fast Transformer Blocks (SDPA/RMSNorm) =====
-# ====================================================
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-    def forward(self, x):
-        norm = x.norm(dim=-1, keepdim=True) / math.sqrt(x.size(-1))
-        return (x / (norm + self.eps)) * self.weight
-
-class SwiGLU(nn.Module):
-    def __init__(self, dim, mult=4):
-        super().__init__()
-        inner = int(dim * mult)
-        self.w1 = nn.Linear(dim, inner, bias=True)
-        self.w2 = nn.Linear(dim, inner, bias=True)
-        self.w3 = nn.Linear(inner, dim, bias=True)
-    def forward(self, x):
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
-    
-class TransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, dropout=0.0, rope=False):
-        super().__init__()
-        self.norm1 = RMSNorm(dim)
-        self.attn = SDPAMultiheadAttention(dim, n_heads=n_heads, rope=rope, dropout=dropout)
-        self.norm2 = RMSNorm(dim)
-        self.ffn = SwiGLU(dim, mult=4)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x, rope_cache=None):
-        x = x + self.drop(self.attn(self.norm1(x), rope_cache=rope_cache))
-        x = x + self.drop(self.ffn(self.norm2(x)))
-        return x
-
-class TransformerEncoder(nn.Module):
-    """
-    Shared encoder for 4 modalities with a modality embedding + CLS token.
-    """
-    def __init__(self, in_dim=64, model_dim=256, depth=6, n_heads=8, rope=True, dropout=0.0, use_checkpoint=False, max_len=512, n_modalities=4):
-        super().__init__()
-        self.in_proj = nn.Linear(in_dim, model_dim)
-        self.cls = nn.Parameter(torch.zeros(1, 1, model_dim))
-        self.mod_emb = nn.Embedding(n_modalities, model_dim)
-        self.blocks = nn.ModuleList([
-            TransformerBlock(model_dim, n_heads=n_heads, dropout=dropout, rope=rope)
-            for _ in range(depth)
-        ])
-        self.norm = RMSNorm(model_dim)
-        self.use_checkpoint = use_checkpoint
-        self.rope = rope
-        self.max_len = max_len
-        self.rope_cache = None  # lazily built
-
-    def _rope(self, x):
-        B, T, D = x.shape
-        # 取第一个 block 的注意力头数
-        n_heads = self.blocks[0].attn.n
-        head_dim = D // n_heads
-        if (self.rope_cache is None) or (self.rope_cache[0].size(1) < T):
-            self.rope_cache = build_rope_cache(max(T, self.max_len), head_dim, x.device)
-        return self.rope_cache
-
-    def forward(self, x, modality_id: int):
-        """
-        x: [B, T, in_dim] (padded if needed). No mask assumed here.
-        """
-        B, T, _ = x.shape
-        x = self.in_proj(x)  # [B,T,D]
-        # prepend CLS
-        cls = self.cls.expand(B, 1, -1)
-        x = torch.cat([cls, x], dim=1)  # [B,1+T,D]
-        # add modality embedding broadcast
-        x = x + self.mod_emb.weight[modality_id].view(1, 1, -1)
-
-        rope_cache = self._rope(x) if self.rope else None
-        for blk in self.blocks:
-            if self.use_checkpoint and self.training:
-                x = torch.utils.checkpoint.checkpoint(blk, x, rope_cache, use_reentrant=False)
-            else:
-                x = blk(x, rope_cache=rope_cache)
-        x = self.norm(x)  # [B,1+T,D]
-        cls_out = x[:, 0]  # [B,D]
-        return cls_out
-
-# ======================================================
-# ======= Multi-Sequence Fusion (simple, effective) =====
-# ======================================================
-class MultiSequenceFuser(nn.Module):
-    def __init__(self, n_modal=4, feat_dim=256):
-        super().__init__()
-        self.attn = ChannelAttention(n_modal * feat_dim)
-        self.fc = nn.Linear(n_modal * feat_dim, feat_dim)
-
-    def forward(self, seq_feats):  # list of [B,D]
-        x = torch.cat(seq_feats, dim=1)  # [B, n_modal*D]
-        x = self.attn(x)
-        x = F.relu(self.fc(x))
-        return x
-
-# ======================================================
-# =================== Full Model =======================
-# ======================================================
-class CrossAttentionFusion(nn.Module):
-    def __init__(self, dim=256):
-        super().__init__()
-        self.fc_q = nn.Linear(dim, dim)
-        self.fc_k = nn.Linear(dim, dim)
-        self.fc_v = nn.Linear(dim, dim)
-        self.fc_out = nn.Linear(dim, dim)
-
-    def forward(self, x1, x2):  # [B,D], [B,D]
-        q = self.fc_q(x1).unsqueeze(1)  # [B,1,D]
-        k = self.fc_k(x2).unsqueeze(1)  # [B,1,D]
-        v = self.fc_v(x2).unsqueeze(1)
-        scale = math.sqrt(x1.size(1))
-        attn = torch.softmax(torch.bmm(q, k.transpose(1, 2)) / scale, dim=-1)
-        out = (attn * v).sum(1)  # [B,D]
-        out = self.fc_out(out + x1 + x2)
-        return out
-
-
-class CapsuleTransformerMultiDiseaseRiskModel(nn.Module):
-    """
-    - Tabular: Capsule extractor
-    - Event sequences: Shared multi-layer Transformer encoder with modality embeddings
-    - Same forward signature & logits as original
-    """
     def __init__(
         self,
-        tab_dims,
-        event_feat_dim=64,
-        out_dim=947,
-        hidden_dim=256,
-        # Transformer hyperparams
-        tr_depth=6,
-        tr_heads=8,
-        tr_rope=True,
-        tr_dropout=0.0,
-        gradient_checkpointing=False,
+        dims: Sequence[int],
+        out_dim: int = 256,
+        num_caps_per_group: int = 4,
+        cap_dim: int = 16,
+        routing_iters: int = 3,
     ):
         super().__init__()
-        torch.set_float32_matmul_precision('high')
-
-        # 1) Tabular via Capsules
-        self.tabular_extractor = TabularCapsuleExtractor(
-            tab_dims, out_dim=hidden_dim, num_caps_per_group=4, cap_dim=16, routing_iters=3
+        self.groups = nn.ModuleList(
+            [
+                PrimaryCapsules(dim, num_caps=num_caps_per_group, cap_dim=cap_dim)
+                for dim in dims
+            ]
+        )
+        self.digit_caps = DigitCapsules(
+            in_caps=len(dims) * num_caps_per_group,
+            in_dim=cap_dim,
+            out_dim=out_dim,
+            routing_iters=routing_iters,
         )
 
-        # 2) Shared Transformer for sequences (4 modalities)
-        self.seq_encoder = TransformerEncoder(
-            in_dim=event_feat_dim, model_dim=hidden_dim, depth=tr_depth, n_heads=tr_heads,
-            rope=tr_rope, dropout=tr_dropout, use_checkpoint=gradient_checkpointing,
-            n_modalities=4
-        )
+    def forward(self, features: Sequence[torch.Tensor]):
+        primaries = [group(feature) for group, feature in zip(self.groups, features)]
+        return self.digit_caps(torch.cat(primaries, dim=1))
 
-        # 3) Fuse 4 modalities
-        self.fuser = MultiSequenceFuser(n_modal=4, feat_dim=hidden_dim)
 
-        # 4) Cross fusion X1 + X2
-        self.cross_attn = CrossAttentionFusion(dim=hidden_dim)
-
-        # 5) Output
-        self.out_fc = nn.Linear(hidden_dim, out_dim)
-
-    @torch.inference_mode(False)
-    def forward(
-        self, Demo, Physical, Biomarkers, Lifestyle, Mental, Environmental, Genetic, Other,
-        X_before_phecode, X_before_phenotypes, X_before_opcs4, X_before_drug
-    ):
-        # 1) Tabular features -> capsule vector
-        feats_list = [Demo, Physical, Biomarkers, Lifestyle, Mental, Environmental, Genetic, Other]
-        x1 = self.tabular_extractor(feats_list)  # [B, hidden_dim]
-
-        # 2) Each event sequence -> Transformer vector (shared encoder + modality id)
-        seq_feats = []
-        seq_inputs = [
-            (X_before_phecode, 0),
-            (X_before_phenotypes, 1),
-            (X_before_opcs4, 2),
-            (X_before_drug, 3),
-        ]
-        for seq, mid in seq_inputs:
-            # seq: [B, T, C] where C == event_feat_dim
-            feat = self.seq_encoder(seq, modality_id=mid)  # [B, hidden_dim]
-            seq_feats.append(feat)
-        x2 = self.fuser(seq_feats)  # [B, hidden_dim]
-
-        # 3) Cross fusion
-        fused = self.cross_attn(x1, x2)  # [B, hidden_dim]
-
-        # 4) logits
-        logits = self.out_fc(fused)
-        return logits
-
-# ================================
-# ===== Convenience builder ======
-# ================================
-def build_model(
-    tab_dims,
-    event_feat_dim=64,
-    out_dim=947,
-    hidden_dim=256,
-    tr_depth=6,
-    tr_heads=8,
-    tr_rope=True,
-    tr_dropout=0.0,
-    gradient_checkpointing=False,
-    enable_compile=True,
-):
-    model = CapsuleTransformerMultiDiseaseRiskModel(
-        tab_dims=tab_dims,
-        event_feat_dim=event_feat_dim,
-        out_dim=out_dim,
-        hidden_dim=hidden_dim,
-        tr_depth=tr_depth,
-        tr_heads=tr_heads,
-        tr_rope=tr_rope,
-        tr_dropout=tr_dropout,
-        gradient_checkpointing=gradient_checkpointing,
+def encoder(dim, heads, depth, dropout):
+    layer = nn.TransformerEncoderLayer(
+        dim,
+        heads,
+        dim * 4,
+        dropout,
+        activation="gelu",
+        batch_first=True,
+        norm_first=True,
     )
-    model = maybe_compile(model, enable_compile)
-    return model
+    return nn.TransformerEncoder(
+        layer, depth, norm=nn.LayerNorm(dim), enable_nested_tensor=False
+    )
 
 
+class EventHierarchy(nn.Module):
+    def __init__(self, vocab, dim, heads, dropout, local_layers=2, global_layers=1):
+        super().__init__()
+        self.dim = dim
+        self.embedding = nn.Embedding(vocab, dim, padding_idx=0)
+        self.position = nn.Parameter(torch.randn(1, 128, dim) * 0.02)
+        self.time = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.local_cls = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.global_cls = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.empty = nn.Parameter(torch.randn(1, dim) * 0.02)
+        self.local = encoder(dim, heads, local_layers, dropout)
+        self.global_encoder = encoder(dim, heads, global_layers, dropout)
+        self.norm = nn.LayerNorm(dim)
+        self.register_buffer(
+            "frequencies",
+            torch.exp(
+                torch.arange(dim // 2).float()
+                * (-math.log(100.0) / max(1, dim // 2 - 1))
+            ),
+        )
+
+    def forward(self, seq):
+        # Token 0 denotes padding; nonzero IDs must be in the fitted vocabulary.
+        tokens = seq[..., 0].long()
+        valid = tokens != 0
+        times = torch.where(valid, seq[..., 1], torch.zeros_like(seq[..., 1]))
+        order = times.masked_fill(~valid, -torch.inf).argsort(
+            dim=1, descending=True, stable=True
+        )
+        tokens, times, valid = [a.gather(1, order) for a in (tokens, times, valid)]
+        batch, length = tokens.shape
+        assert length == 128
+        angle = times.unsqueeze(-1).clamp(-100.0, 100.0) * self.frequencies
+        x = (
+            self.embedding(tokens)
+            + self.time(torch.cat((angle.sin(), angle.cos()), -1))
+            + self.position
+        )
+        x = x.masked_fill(~valid.unsqueeze(-1), 0.0)
+        # Three full overlapping windows cover all 128 events, with no tail loss.
+        starts = (0, 32, 64)
+        windows = torch.stack([x[:, s : s + 64] for s in starts], 1)
+        masks = torch.stack([valid[:, s : s + 64] for s in starts], 1)
+        flat = windows.reshape(batch * 3, 64, self.dim)
+        local_input = torch.cat((self.local_cls.expand(batch * 3, -1, -1), flat), 1)
+        local_valid = torch.cat(
+            (
+                torch.ones(batch * 3, 1, dtype=torch.bool, device=x.device),
+                masks.reshape(batch * 3, 64),
+            ),
+            1,
+        )
+        local = self.local(local_input, src_key_padding_mask=~local_valid).reshape(
+            batch, 3, 65, self.dim
+        )
+        window_valid = masks.any(-1)
+        global_input = torch.cat(
+            (self.global_cls.expand(batch, -1, -1), local[:, :, 0]), 1
+        )
+        global_valid = torch.cat(
+            (torch.ones(batch, 1, dtype=torch.bool, device=x.device), window_valid), 1
+        )
+        pooled = self.global_encoder(global_input, src_key_padding_mask=~global_valid)[
+            :, 0
+        ]
+        has_record = valid.any(1)
+        pooled = self.norm(torch.where(has_record[:, None], pooled, self.empty))
+        # Restore local event states in original sorted positions, averaging overlaps.
+        event_states = x.new_zeros(batch, length, self.dim)
+        overlap = x.new_zeros(1, length, 1)
+        for j, start in enumerate(starts):
+            event_states[:, start : start + 64] = (
+                event_states[:, start : start + 64] + local[:, j, 1:]
+            )
+            overlap[:, start : start + 64] += 1
+        event_states = (event_states / overlap).masked_fill(~valid.unsqueeze(-1), 0.0)
+        states = torch.cat((pooled[:, None], event_states), 1)
+        state_mask = torch.cat(
+            (torch.ones(batch, 1, dtype=torch.bool, device=x.device), valid), 1
+        )
+        return pooled, states, state_mask, has_record
+
+
+class TableHierarchy(nn.Module):
+    def __init__(self, dims, dim):
+        super().__init__()
+        self.capsules = TabularCapsuleExtractor(dims, dim, 4, 16, 3)
+        self.group_projection = nn.ModuleList([nn.Linear(64, dim) for _ in dims])
+        self.group_type = nn.Parameter(torch.randn(1, len(dims), dim) * 0.02)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, arrays):
+        primary = [layer(x) for layer, x in zip(self.capsules.groups, arrays)]
+        pooled = self.norm(self.capsules.digit_caps(torch.cat(primary, 1)))
+        groups = torch.stack(
+            [layer(x.flatten(1)) for layer, x in zip(self.group_projection, primary)], 1
+        )
+        states = torch.cat((pooled[:, None], groups + self.group_type), 1)
+        return (
+            pooled,
+            states,
+            torch.ones(states.shape[:2], dtype=torch.bool, device=states.device),
+        )
+
+
+def named_module(seed, name, factory):
+    number = int.from_bytes(
+        hashlib.sha256(f"{seed}:{name}".encode()).digest()[:8], "big"
+    ) % (2**63 - 1)
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(number)
+        return factory()
+
+
+class Block(nn.Module):
+    def __init__(self, d, h, p):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d)
+        self.norm2 = nn.LayerNorm(d)
+        self.attention = nn.MultiheadAttention(d, h, dropout=p, batch_first=True)
+        self.ff = nn.Sequential(
+            nn.Linear(d, 2 * d), nn.GELU(), nn.Dropout(p), nn.Linear(2 * d, d)
+        )
+        self.dropout = nn.Dropout(p)
+
+    def forward(self, x, valid, mask=None):
+        y = self.norm1(x)
+        x = x + self.dropout(
+            self.attention(
+                y, y, y, key_padding_mask=~valid, attn_mask=mask, need_weights=False
+            )[0]
+        )
+        x = x + self.dropout(self.ff(self.norm2(x)))
+        return x.masked_fill(~valid[..., None], 0.0)
+
+
+class Fusion(nn.Module):
+    """Two synchronous rounds through 32 shared bottleneck states."""
+
+    def __init__(self, seed, dim=256, heads=8, dropout=0.1):
+        super().__init__()
+        self.retained = list(range(5))
+        self.blocks = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        str(m): named_module(
+                            seed,
+                            f"fusion.block{r}.source{m}",
+                            lambda: Block(dim, heads, dropout),
+                        )
+                        for m in self.retained
+                    }
+                )
+                for r in range(2)
+            ]
+        )
+        self.z0 = named_module(
+            seed, "fusion.z0", lambda: nn.Parameter(torch.randn(1, 32, dim) * 0.02)
+        )
+
+    def forward(self, states, masks):
+        h = list(states)
+        z = self.z0.expand(h[0].shape[0], -1, -1)
+        for blocks in self.blocks:
+            updated, temporary = [], []
+            # Every source reads the same previous-round shared state.
+            for m, x, valid_source in zip(self.retained, h, masks):
+                joined = torch.cat([x, z], 1)
+                valid = torch.cat(
+                    [
+                        valid_source,
+                        torch.ones(z.shape[:2], dtype=torch.bool, device=x.device),
+                    ],
+                    1,
+                )
+                out = blocks[str(m)](joined, valid)
+                updated.append(out[:, : x.shape[1]])
+                temporary.append(out[:, x.shape[1] :])
+            h = updated
+            z = torch.stack(temporary).mean(0)
+        return h, z.mean(1)
+
+
+class SEBFormer(nn.Module):
+    """Four coded sources plus nine baseline domains, with one linear readout.
+
+    Args:
+        group_dims: Encoded widths of the nine baseline domains, in input order.
+        num_labels: Number of output labels (1,507 in the UKB task).
+        vocab_size: Shared vocabulary size including padding index 0.
+        seed: Per-fold initialization seed (43--47 for the primary experiment).
+
+    forward takes nine [batch, domain_width] baseline tensors followed by four
+    [batch, 128, 2] event tensors: diagnoses, phenotype fields, procedures, drugs.
+    It returns main logits and a dictionary containing five auxiliary logits.
+    """
+
+    def __init__(
+        self, group_dims, num_labels, vocab_size, seed, dim=256, heads=8, dropout=0.1
+    ):
+        super().__init__()
+        if len(group_dims) != 9 or any(type(x) is not int or x < 1 for x in group_dims):
+            raise ValueError("group_dims must contain nine positive integer widths")
+        if type(num_labels) is not int or num_labels < 1:
+            raise ValueError("num_labels must be a positive integer")
+        if type(vocab_size) is not int or vocab_size < 2:
+            raise ValueError("vocab_size must include padding and at least one token")
+        if dim < 2 or heads < 1 or dim % 2 or dim % heads:
+            raise ValueError("dim must be even and divisible by heads")
+        if not 0 <= dropout < 1:
+            raise ValueError("dropout must lie in [0, 1)")
+        self.retained = list(range(5))
+        self.events = nn.ModuleDict(
+            {
+                str(m): named_module(
+                    seed,
+                    f"events.{m}",
+                    lambda: EventHierarchy(vocab_size, dim, heads, dropout, 2, 1),
+                )
+                for m in range(4)
+            }
+        )
+        self.table = named_module(
+            seed, "table", lambda: TableHierarchy(group_dims, dim)
+        )
+        self.aux = nn.ModuleDict(
+            {
+                str(m): named_module(
+                    seed, f"aux.{m}", lambda: nn.Linear(dim, num_labels)
+                )
+                for m in self.retained
+            }
+        )
+        self.fusion = Fusion(seed, dim, heads, dropout)
+        self.norms = nn.ModuleDict({str(m): nn.LayerNorm(dim) for m in self.retained})
+        self.common_norm = nn.LayerNorm(dim)
+        self.final = named_module(seed, "final", lambda: nn.Linear(6 * dim, num_labels))
+
+    def encode(self, args):
+        pooled, states, masks = [], [], []
+        for m in self.retained:
+            if m < 4:
+                p, s, v, _ = self.events[str(m)](args[9 + m])
+            else:
+                p, s, v = self.table(args[:9])
+            pooled.append(p)
+            states.append(s)
+            masks.append(v)
+        return pooled, states, masks
+
+    def forward(self, *args):
+        if len(args) != 13:
+            raise ValueError(
+                "Expected nine baseline tensors followed by four event tensors"
+            )
+        pooled, states, masks = self.encode(args)
+        h, common = self.fusion(states, masks)
+        features = torch.cat(
+            [self.norms[str(m)](x[:, 0]) for m, x in zip(self.retained, h)]
+            + [self.common_norm(common)],
+            -1,
+        )
+        logits = self.final(features)
+        branch = torch.stack(
+            [self.aux[str(m)](x) for m, x in zip(self.retained, pooled)], 1
+        )
+        return logits, dict(branch_logits=branch, retained_sources=self.retained)
