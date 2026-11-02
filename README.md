@@ -4,6 +4,10 @@ Minimal PyTorch implementation of SEBFormer with baseline and event preprocessin
 The model retains the source-specific encoders, shared bottleneck fusion and
 linear prediction head used in the revised manuscript.
 
+## Architecture
+
+![SEBFormer architecture](architecture.png)
+
 ## Run
 
 ```bash
